@@ -3,8 +3,16 @@ use crate::retry::{RetryPolicy, DEFAULT_RETRY};
 use core::pin::Pin;
 use eventsource_stream::Eventsource;
 pub use eventsource_stream::{Event as MessageEvent, EventStreamError};
-use futures_core::future::{BoxFuture, Future};
-use futures_core::stream::{BoxStream, Stream};
+#[cfg(not(target_arch = "wasm32"))]
+use futures_core::future::BoxFuture;
+use futures_core::future::Future;
+#[cfg(target_arch = "wasm32")]
+use futures_core::future::LocalBoxFuture;
+#[cfg(not(target_arch = "wasm32"))]
+use futures_core::stream::BoxStream;
+#[cfg(target_arch = "wasm32")]
+use futures_core::stream::LocalBoxStream;
+use futures_core::stream::Stream;
 use futures_core::task::{Context, Poll};
 use futures_timer::Delay;
 use pin_project_lite::pin_project;
@@ -12,8 +20,16 @@ use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Error as ReqwestError, IntoUrl, RequestBuilder, Response, StatusCode};
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 type ResponseFuture = BoxFuture<'static, Result<Response, ReqwestError>>;
+#[cfg(target_arch = "wasm32")]
+type ResponseFuture = LocalBoxFuture<'static, Result<Response, ReqwestError>>;
+
+#[cfg(not(target_arch = "wasm32"))]
 type EventStream = BoxStream<'static, Result<MessageEvent, EventStreamError<ReqwestError>>>;
+#[cfg(target_arch = "wasm32")]
+type EventStream = LocalBoxStream<'static, Result<MessageEvent, EventStreamError<ReqwestError>>>;
+
 type BoxedRetry = Box<dyn RetryPolicy + Send + Unpin + 'static>;
 
 /// The ready state of an [`EventSource`]
@@ -99,29 +115,38 @@ impl EventSource {
     }
 }
 
-fn check_response(response: &Response) -> Result<(), Error> {
+fn check_response(response: Response) -> Result<Response, Error> {
     match response.status() {
         StatusCode::OK => {}
         status => {
-            return Err(Error::InvalidStatusCode(status));
+            return Err(Error::InvalidStatusCode(status, response));
         }
     }
-    let content_type = response
-        .headers()
-        .get(&reqwest::header::CONTENT_TYPE)
-        .ok_or_else(|| Error::InvalidContentType(HeaderValue::from_static("")))?;
-    let mime_type: mime::Mime = content_type
+    let content_type =
+        if let Some(content_type) = response.headers().get(&reqwest::header::CONTENT_TYPE) {
+            content_type
+        } else {
+            return Err(Error::InvalidContentType(
+                HeaderValue::from_static(""),
+                response,
+            ));
+        };
+    if content_type
         .to_str()
-        .map_err(|_| Error::InvalidContentType(content_type.clone()))?
-        .parse()
-        .map_err(|_| Error::InvalidContentType(content_type.clone()))?;
-    if !matches!(
-        (mime_type.type_(), mime_type.subtype()),
-        (mime::TEXT, mime::EVENT_STREAM)
-    ) {
-        return Err(Error::InvalidContentType(content_type.clone()));
+        .map_err(|_| ())
+        .and_then(|s| s.parse::<mime::Mime>().map_err(|_| ()))
+        .map(|mime_type| {
+            matches!(
+                (mime_type.type_(), mime_type.subtype()),
+                (mime::TEXT, mime::EVENT_STREAM)
+            )
+        })
+        .unwrap_or(false)
+    {
+        Ok(response)
+    } else {
+        Err(Error::InvalidContentType(content_type.clone(), response))
     }
-    Ok(())
 }
 
 impl<'a> EventSourceProjection<'a> {
@@ -210,12 +235,16 @@ impl Stream for EventSource {
             match response_future.poll(cx) {
                 Poll::Ready(Ok(res)) => {
                     this.clear_fetch();
-                    if let Err(err) = check_response(&res) {
-                        *this.is_closed = true;
-                        return Poll::Ready(Some(Err(err)));
+                    match check_response(res) {
+                        Ok(res) => {
+                            this.handle_response(res);
+                            return Poll::Ready(Some(Ok(Event::Open)));
+                        }
+                        Err(err) => {
+                            *this.is_closed = true;
+                            return Poll::Ready(Some(Err(err)));
+                        }
                     }
-                    this.handle_response(res);
-                    return Poll::Ready(Some(Ok(Event::Open)));
                 }
                 Poll::Ready(Err(err)) => {
                     let err = Error::Transport(err);
